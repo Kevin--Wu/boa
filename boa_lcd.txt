@@ -1,0 +1,415 @@
+#include <stdio.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <memory.h>
+#include <string.h>
+#include <pthread.h>
+
+#include <linux/videodev.h>
+#include <sys/ioctl.h>
+
+#include <fcntl.h>
+#include <linux/fb.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include "ASC16.h"
+#include "HZK16.h"
+
+#define ERR_FRAME_BUFFER 1
+//#include "video_test.h"
+#define FB_FILE "/dev/fb0"
+//LCD 设备文件
+#define FRAME_SIZE 320*240*sizeof(unsigned short)
+#define PORT 4321
+
+typedef struct _fb_buf
+{
+	int fbfd;
+	struct fb_var_screeninfo vinfo;
+	struct fb_fix_screeninfo finfo;
+	char *fbp;	
+}fb_buf;
+
+unsigned short tempbuf2[240][320];
+
+
+/***************************************************
+
+以下两个函数用于对LCD屏幕初始化以及控制显示
+
+****************************************************/
+void rgb_to_framebuffer(fb_buf *fb,int width,int height,int xoffset,int yoffset,unsigned short  *img_ptr )  
+{
+	int x,y;
+	int location;
+	unsigned short *loca_ptr;
+	// Figure out where in memory to put the pixel
+
+	for ( y = 0; y < height; y++ )							// 纵扫描
+	{
+		location = xoffset * 2 + (y + yoffset) * fb->finfo.line_length;	
+		loca_ptr = (unsigned short *) (fb->fbp + location);	       	
+		for ( x = 0; x < width; x++ ) 						// 行扫描		
+		{
+			*(loca_ptr + x) = *img_ptr++;
+		}
+	}
+}
+
+int open_framebuffer(char *ptr,fb_buf *fb)
+{
+	int fbfd,screensize;
+	// Open the file for reading and writing
+	fbfd = open( ptr, O_RDWR);
+	if (fbfd < 0) 
+	{
+		printf("Error: cannot open framebuffer device.%x\n",fbfd);
+		return ERR_FRAME_BUFFER;
+	}
+	printf("The framebuffer device was opened successfully.\n");
+		
+	fb->fbfd = fbfd;								// 保存打开FrameBuffer设备的句柄
+	
+	// Get fixed screen information	获取FrameBuffer固定不变的信息
+	if (ioctl(fbfd, FBIOGET_FSCREENINFO, &fb->finfo)) 
+	{
+		printf("Error reading fixed information.\n");
+		return ERR_FRAME_BUFFER;
+	}
+
+	// Get variable screen information 获取FrameBuffer屏幕可变的信息
+	if (ioctl(fbfd, FBIOGET_VSCREENINFO, &fb->vinfo)) 
+	{
+		printf("Error reading variable information.\n");
+		return ERR_FRAME_BUFFER;
+	}
+
+	printf("%dx%d, %dbpp, xoffset=%d ,yoffset=%d \n", fb->vinfo.xres, fb->vinfo.yres, fb->vinfo.bits_per_pixel,fb->vinfo.xoffset,fb->vinfo.yoffset );
+
+	// Figure out the size of the screen in bytes
+	screensize = fb->vinfo.xres * fb->vinfo.yres * fb->vinfo.bits_per_pixel / 8;
+
+	// Map the device to memory
+	fb->fbp = (char *)mmap(0,screensize,PROT_READ|PROT_WRITE,MAP_SHARED,fbfd,0); 
+	// 影射Framebuffer设备到内存
+	if ((int)fb->fbp == -1) 
+	{
+		printf("Error: failed to map framebuffer device to memory.\n");
+		return ERR_FRAME_BUFFER;
+	}
+	printf("The framebuffer device was mapped to memory successfully.\n");
+	return  0;
+}
+
+
+//16*16的字符显示
+void lcd_dischar_1616(unsigned char ch[],int x,int y,int color)
+{	
+	int i,j,cur=0;
+	for(i=0;i<16;++i)
+	{
+		for(j=0;j<8;++j)
+			if(ch[cur]&(1<<(7-j)))tempbuf2[x+i][y+j]=color;
+		++cur;
+		for(j=0;j<8;++j)
+			if(ch[cur]&(1<<(7-j)))tempbuf2[x+i][y+j+8]=color;
+		++cur;
+	}
+}
+
+
+//8*16的字符显示
+void lcd_dischar_816(unsigned char ch[],int x,int y,int color)
+{	
+	int i,j,cur=0;
+	for(i=0;i<16;++i)
+	{
+		for(j=0;j<8;++j)
+			if(ch[cur]&(1<<(7-j)))tempbuf2 [x+i][y+j]=color;
+		++cur;
+	}
+}
+
+
+
+
+
+
+int start,lcdstart;
+int fdfifo,fdled;
+double delay;
+int style;
+
+//线程函数，用于控制LED灯
+void *pth_fun(void *arg)
+{
+	int i,j,k,temp;
+	
+	while(start==0)sleep(1);
+	int speed;
+	while(1)
+	{
+		speed=(int)(delay*1000000);
+		switch(style)
+		{
+		case 0:
+			for(i=0;i<4;++i)
+			{
+				ioctl(fdled,1,i);
+				usleep(speed);
+				ioctl(fdled,0,i);
+			}
+			break;
+		case 1:
+			for(i=0;i<16;++i)
+			{
+				for(k=0;k<4;++k)
+					ioctl(fdled,0,k);
+				temp=i;
+				j=0;
+				while(temp>0)
+				{
+					if(temp%2)
+						ioctl(fdled,1,j);
+					else
+						ioctl(fdled,0,j);
+					++j;
+					temp/=2;
+				}
+				usleep(speed);
+			}
+			break;
+		case 2:
+			for(k=0;k<4;++k)
+				ioctl(fdled,0,k);
+			usleep(speed);
+			break;
+		}
+	}
+}
+
+
+char showstr[30][255];//储存要显示的字符
+fb_buf fb;
+unsigned short tempbuf[320*240];//帧缓存
+int segment;//记录要显示的字符串有多少个单词
+char query[2048];//要显示的整个字符串
+
+void *pth_fun2(void *arg)
+{
+	while(lcdstart==0)sleep(1);
+	int speed;
+	int i,j,k,locx=110,locy=0,loc;
+	int tempx=locx,tempy=0,lastx,lasty;
+	int quma,weima;//汉字库的区位码
+	speed=100000;//用于调整LCD屏幕变幻频率
+	int color=0xffff;
+	while(1)
+	{
+		//把上一次显示的位置涂黑
+		loc=0;
+		for(i=0;i<segment;++i)
+		{
+			for(j=0;j<strlen(showstr[loc]);)
+			{
+				/*if(tempy+16>=320)//如果此字符超出边界，则换到下一行显示
+				{
+					tempx+=18;
+					tempy=0;
+				}*/
+
+				if(showstr[loc][j]=='%')
+				{
+					++j;
+					if(showstr[loc][j]<='9')quma=(int)(showstr[loc][j]-'0');
+					else quma=(int)(showstr[loc][j]-'A')+10;
+					quma*=16;
+					++j;
+					if(showstr[loc][j]<='9')quma+=(int)(showstr[loc][j]-'0');
+					else quma+=(int)(showstr[loc][j]-'A')+10;
+					j+=2;
+					if(showstr[loc][j]<='9')weima=(int)(showstr[loc][j]-'0');
+					else weima=(int)(showstr[loc][j]-'A')+10;
+					weima*=16;
+					++j;
+					if(showstr[loc][j]<='9')weima+=(int)(showstr[loc][j]-'0');
+					else weima+=(int)(showstr[loc][j]-'A')+10;
+
+					lcd_dischar_1616(&szHZK16[((quma-161)*94+(weima-161))*32],tempx,tempy,0);
+					tempy+=16;
+					++j;
+				}
+				else
+				{
+					lcd_dischar_816(&szASC16[showstr[loc][j]*16],tempx,tempy,0);
+					tempy+=8;
+					++j;
+				}
+
+			}
+			++loc;//储存要抹去的是第几个单词
+			tempy+=8;
+		}
+
+		//刷新要显示的位置
+		locy=lasty+8;
+		if(locy>=320)locy=0;
+		lasty=locy;
+		tempx=locx;tempy=locy;//方便下次显示时，抹去以前的痕迹
+		loc=0;
+		for(i=0;i<segment;++i)
+		{
+			for(j=0;j<strlen(showstr[loc]);)
+			{
+				/*if(locy+16>=320)//如果此字符超出边界，则换到下一行显示
+				{
+					locx+=18;
+					locy=0;
+				}*/
+
+				if(showstr[loc][j]=='%')
+				{
+					++j;
+					if(showstr[loc][j]<='9')quma=(int)(showstr[loc][j]-'0');
+					else quma=(int)(showstr[loc][j]-'A')+10;
+					quma*=16;
+					++j;
+					if(showstr[loc][j]<='9')quma+=(int)(showstr[loc][j]-'0');
+					else quma+=(int)(showstr[loc][j]-'A')+10;
+					j+=2;
+					if(showstr[loc][j]<='9')weima=(int)(showstr[loc][j]-'0');
+					else weima=(int)(showstr[loc][j]-'A')+10;
+					weima*=16;
+					++j;
+					if(showstr[loc][j]<='9')weima+=(int)(showstr[loc][j]-'0');
+					else weima+=(int)(showstr[loc][j]-'A')+10;
+
+					lcd_dischar_1616(&szHZK16[((quma-161)*94+(weima-161))*32],locx,locy,color);
+					locy+=16;
+					++j;
+				}
+				else
+				{
+					lcd_dischar_816(&szASC16[showstr[loc][j]*16],locx,locy,color);
+					locy+=8;
+					++j;
+				}
+
+			}
+			++loc;//储存要显示的是第几个单词
+			locy+=8;
+		}
+
+
+		//把字显示出来
+		loc=0;
+		for(i=0;i<240;i++)
+			for(j=0;j<320;++j)
+				tempbuf[loc++] = tempbuf2[i][j];
+		rgb_to_framebuffer(&fb,320,240,0,0,tempbuf);
+
+
+		usleep(speed);
+	}
+}
+		
+
+
+int main()
+{
+	fdfifo=open("/tmp/led-control",O_RDWR);
+	if(fdfifo<0)
+	{
+		perror("fifo open:");
+		exit(0);
+	}
+
+	fdled=open("/dev/leds",O_WRONLY);
+	if(fdled<0)
+	{
+		perror("driver open:");
+		exit(0);
+	}
+
+	int i,j,loc;
+	
+	unsigned short *tmp;
+	char tempstr[2048];
+	if(open_framebuffer(FB_FILE,&fb)!=0)
+	{
+			printf("open framebuffer error\n");
+			return -1;
+	}
+
+	for(i=0;i<240;++i)
+    	for(j=0;j<320;++j)
+    	    /*if((i-120)*(i-120)+(j-160)*(j-160)<=400)//画个圆 测试一下结果
+    	        tempbuf2[i][j]=0xffff;
+    	    else*/
+    	        tempbuf2[i][j]=0x00;
+	loc=0;
+	for(i=0;i<240;i++)
+    	for(j=0;j<320;++j)
+            tempbuf[loc++] = tempbuf2[i][j];
+	rgb_to_framebuffer(&fb,320,240,0,0,tempbuf);
+	
+	char order[255];
+	char mode[10],speed[10];
+
+	pthread_t pth;
+	start=0;
+	pthread_create(&pth,NULL,pth_fun,(void*)1);
+
+	pthread_t pth2;
+	lcdstart=0;
+	pthread_create(&pth2,NULL,pth_fun2,(void*)1);
+
+	while(1)
+	{
+		
+		memset(order,0,sizeof(order));
+		memset(mode,0,sizeof(mode));
+		memset(speed,0,sizeof(speed));
+		memset(query,0,sizeof(query));
+
+		
+			
+		read(fdfifo,order,sizeof(order));
+		
+		strcpy(mode,strtok(order," "));
+		strcpy(speed,strtok(NULL," "));
+		strcpy(query,strtok(NULL," "));
+
+		delay=atof(speed);
+		style=atoi(mode);
+		printf("%d %d %s",style,(int)(delay*1000000),query);
+
+		lcdstart=0;
+		//把屏幕重新刷为黑色
+		for(i=0;i<240;++i)
+			for(j=0;j<320;++j)
+				tempbuf2[i][j]=0x00;
+		//求得要显示的字符总串
+		strcpy(tempstr,strtok(query,"&"));
+		strcpy(query,strtok(tempstr,"="));
+		strcpy(query,strtok(NULL,"="));
+		//求得要显示的各个单词
+		segment=1;//一共有几个单词
+		for(i=0;i<strlen(query);++i)
+			if(query[i]=='+')++segment;
+		strcpy(showstr[0],strtok(query,"+"));
+		for(i=1;i<segment;++i)
+			strcpy(showstr[i],strtok(NULL,"+"));
+		
+
+
+		lcdstart=1;
+		start=1;
+	}
+
+	
+	close(fdled);
+	close(fdfifo);
+	return 0;
+}

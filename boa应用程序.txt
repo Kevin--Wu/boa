@@ -1,0 +1,120 @@
+#include <stdio.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <memory.h>
+#include <string.h>
+#include <pthread.h>
+
+int start;
+int fdfifo,fdled;
+double delay;
+int style;
+
+int mypow(int i,int j)
+{
+	int k;
+	int ret=1;
+	for(k=1;k<=j;++k)
+	{
+		ret*=i;
+	}
+	return ret;
+}
+
+void *pth_fun(void *arg)
+{
+	int i,j,k,temp;
+	
+	while(start==0)sleep(1);
+	int speed;
+	while(1)
+	{
+		speed=(int)(delay*1000000);
+		switch(style)
+		{
+		case 0:
+			for(i=0;i<4;++i)
+			{
+				ioctl(fdled,1,i);
+				usleep(speed);
+				ioctl(fdled,0,i);
+			}
+			break;
+		case 1:
+			for(i=0;i<16;++i)
+			{
+				for(k=0;k<4;++k)
+					ioctl(fdled,0,k);
+				temp=i;
+				j=0;
+				while(temp>0)
+				{
+					if(temp%2)
+						ioctl(fdled,1,j);
+					else
+						ioctl(fdled,0,j);
+					++j;
+					temp/=2;
+				}
+				usleep(speed);
+			}
+			break;
+		case 2:
+			for(k=0;k<4;++k)
+				ioctl(fdled,0,k);
+			usleep(speed);
+			break;
+		}
+	}
+}
+
+int main()
+{
+	fdfifo=open("/tmp/led-control",O_RDWR);
+	if(fdfifo<0)
+	{
+		perror("fifo open:");
+		exit(0);
+	}
+
+	fdled=open("/dev/leds",O_WRONLY);
+	if(fdled<0)
+	{
+		perror("driver open:");
+		exit(0);
+	}
+	
+	char order[25];
+	char mode[10],speed[10];
+	int i;
+
+	pthread_t pth;
+	start=0;
+	pthread_create(&pth,NULL,pth_fun,(void*)1);
+
+	while(1)
+	{
+		memset(order,0,sizeof(order));
+		memset(mode,0,sizeof(mode));
+		memset(speed,0,sizeof(speed));
+
+		read(fdfifo,order,sizeof(order));
+		
+		
+		strcpy(mode,strtok(order," "));
+		strcpy(speed,strtok(NULL," "));
+		speed[strlen(speed)-1]=0;
+
+		delay=atof(speed);
+		style=atoi(mode);
+		printf("%d %d\n",style,(int)(delay*1000000));
+		start=1;
+		//printf("%s %s\n",mode,speed);
+		//sleep(1);
+	}
+
+	
+	close(fdled);
+	close(fdfifo);
+	return 0;
+}
